@@ -1,0 +1,975 @@
+#!/usr/bin/perl 
+################################################################################
+# 20130101 Kirby  v2.0
+# 20100909 Kirby  v2.0rc3
+# 20081226 Kirby  v2.0rc2
+# 20081205 Kirby  v2.0rc1
+# 20081102 Kirby  v2.0beta
+# 20050714 Kirby  added test subroutine to run after rotation, v1.04
+# 20050700 Kirby  new locking mechanism, v1.03
+# 20040813 Kirby  extra debugging
+# 20040719 Kirby  scp sometimes lies, v1.02
+# 20040202 Kirby  cleanup, v1.01
+# 20030920 Kirby  initial release v1.0
+################################################################################
+
+# LICENSE
+#
+#    SSH-KeyRot is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    SSH-KeyRot is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with SSH-KeyRot; if not, write to the Free Software
+#    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+use Getopt::Long;
+use Socket;
+use IO::Socket::INET;
+use POSIX qw(strftime);
+use Proc::ProcessTable;
+use strict;
+use Carp;
+use English '-no_match_vars';
+use IPC::Open3 'open3';
+use Net::SCP::Expect;
+use Net::SSH::Expect;
+use Mail::Sendmail;
+
+#use warnings;
+#use diagnostics;
+#use Carp::Source::Always;
+
+&Main;
+
+################################################################################
+sub Main {
+        my %kr = ();
+        BuildEnv( \%kr );
+
+        if ( $kr{PrintUsage} == 1 ) {
+                &PrintUsage;
+                exit 1;
+        }
+
+        if ( $kr{PrintReadme} == 1 ) {
+                &PrintReadme;
+                exit 1;
+        }
+
+        #
+        # check minimum requirements
+        #
+        unless ( $kr{HOST} ) {
+                &PrintUsage;
+                &Alert( \%kr, 1, __LINE__, "Host not defined" );
+        }
+        unless ( $kr{REMOTEUSER} ) {
+                &PrintUsage;
+                &Alert( \%kr, 1, __LINE__, "Remote User not defined" );
+        }
+        unless ( $kr{KEYS} ) {
+                &PrintUsage;
+                &Alert( \%kr, 1, __LINE__, "Local Key not defined" );
+        }
+        unless ( $kr{REMOTEAUTHKEYS} ) {
+                &PrintUsage;
+                &Alert( \%kr, 1, __LINE__, "Remote key not defined" );
+        }
+        unless ( $kr{EMAIL} ) {
+                &PrintUsage;
+                &Alert( \%kr, 1, __LINE__, "Email not defined" );
+        }
+
+        #
+        # poke, cycle, test, and cleanup
+        #
+        &Debug( \%kr, __LINE__, "Rotating $kr{HOST} keys" );
+        if ( &TestConnect( \%kr, $kr{HOST} ) != 0 ) {
+                &Alert( \%kr, 1, __LINE__, "Cannot connect to $kr{HOST} on port 22" );
+        }
+        if ( $kr{PWFILE} ) {
+
+                # try each password from file and set $kr{PASSWORD}
+                &GetPassword( \%kr );
+        }
+        &CycleKeys( \%kr );
+        &TestKeys( \%kr );
+        &Cleanup( \%kr );
+
+        return 0;
+}
+################################################################################
+
+################################################################################
+sub Debug {
+
+        my $kr     = shift;
+        my $line   = shift;
+        my $string = shift;
+        my $debuglogfile;
+
+        if ( $$kr{DEBUG} == 1 ) {
+                open( $debuglogfile, '>>', "$$kr{DEBUGLOG}" )
+                  or croak "Unable to open debuglog $$kr{DEBUGLOG} on line " . __LINE__ . ": $OS_ERROR";
+                print $debuglogfile qq(${line}: $string\n\n##\n);
+                print qq(${line}: $string\n\n##\n);
+                close($debuglogfile);
+        }
+
+        return 0;
+}
+################################################################################
+
+################################################################################
+sub GetPassword {
+        my $kr = shift;
+        my @passwords;
+        my $password;
+
+        #
+        &Debug( $kr, __LINE__, "GetPassword start  ####################" );
+
+        #
+
+        open( PWFD, '<', $$kr{PWFILE} ) or &Alert( $kr, 1, __LINE__, "Unable to open $$kr{PWFILE} \n$OS_ERROR" );
+        while (<PWFD>) {
+                chomp;
+                push( @passwords, $_ );
+        }
+        close(PWFD);
+
+        foreach my $password (@passwords) {
+                my $ssh = Net::SSH::Expect->new(
+                        host     => $$kr{HOST},
+                        password => $password,
+                        user     => $$kr{REMOTEUSER},
+                        raw_pty  => 1
+                );
+                my $login_output = $ssh->login();
+                my $cmdOut       = $ssh->exec("echo SUCCESS");
+                $ssh->close();
+                if ( grep( /SUCCESS/, $cmdOut ) ) {
+                        $$kr{PASSWORD} = $password;
+                        last;
+                }
+        }
+        if ( $$kr{PASSWORD} =~ /.+/ ) {
+                return 0;
+        } else {
+                &Alert( $kr, 1, __LINE__, "Unable to find good password in $$kr{PWFILE}" );
+        }
+}
+################################################################################
+
+################################################################################
+sub TestConnect {
+        my $kr          = shift;
+        my $host        = shift;
+        my $socketvalue = 0;
+        my $socket;
+
+        $socket = IO::Socket::INET->new(
+                PeerAddr => $host,
+                PeerPort => 22,
+                Timeout  => 10,
+                Proto    => "tcp",
+                Type     => SOCK_STREAM
+        ) or $socketvalue = 1;
+        close($socket);
+
+        # try again
+        if ( $socketvalue == 1 ) {
+                &Debug( $kr, __LINE__, "first testconnect attempt failed. trying again" );
+                $socketvalue = 0;
+                sleep(5);
+                $socket = IO::Socket::INET->new(
+                        PeerAddr => $host,
+                        PeerPort => 22,
+                        Timeout  => 20,
+                        Proto    => "tcp",
+                        Type     => SOCK_STREAM
+                ) or $socketvalue = 1;
+                close($socket);
+        }
+
+        &Debug( $kr, __LINE__, "socketvalue is $socketvalue" );
+        return $socketvalue;
+}
+################################################################################
+
+################################################################################
+sub Cleanup {
+
+        my $kr = shift;
+
+        if ( $$kr{DEBUG} == 1 ) {
+                &Debug( $kr, __LINE__, "Skipping Cleanup" );
+                return 1;
+        }
+        if ( -f "$$kr{NEWKEY}.pub" ) {
+                unlink("$$kr{NEWKEY}.pub");
+        }
+        if ( -f "$$kr{NEWKEY}" ) {
+                unlink("$$kr{NEWKEY}");
+        }
+        if ( -f "$$kr{NEWAUTHKEYS}" ) {
+                unlink("$$kr{NEWAUTHKEYS}");
+        }
+        if ( -f "$$kr{TMPDIR}/lock" ) {
+                unlink("$$kr{TMPDIR}/lock");
+        }
+        if ( -d "$$kr{TMPDIR}" ) {
+                rmdir("$$kr{TMPDIR}");
+        }
+
+        return 0;
+}
+################################################################################
+
+################################################################################
+sub BuildEnv {
+
+        my $kr = shift;
+        my %opts;
+        my @a_keys;
+        my $key;
+        my $cmd;
+        my @cmdtmp;
+        my $cmdIn;
+        my $cmdOut;
+        my $cmdErr;
+        my $pid;
+
+        #
+        # die after 1 hour of hanging
+        #
+        $SIG{'ALRM'} = sub {
+                &Alert( $kr, 1, __LINE__, "ERROR: $0 timed out after 1 hour" );
+        };
+        alarm(3600);
+
+        $SIG{CHLD} = 'IGNORE';
+
+        #
+        # preserve the argv for use in alerts
+        #
+        $$kr{cmdargs} = qq(@ARGV);
+
+        #
+        # set the umask
+        #
+        umask(0077);
+
+        #
+        # tmporary files are stored in user's .ssh dir
+        #
+        $$kr{TMPDIR} = "$ENV{HOME}/.ssh/tmp.$$";
+        if ( !-d $$kr{TMPDIR} ) {
+                mkdir( "$$kr{TMPDIR}", 0700 );
+        }
+
+        $cmd = q(/bin/uname -n);
+        $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+        waitpid( $pid, 0 );
+        $$kr{THISHOST} = <$cmdOut>;
+        chomp $$kr{THISHOST};
+        if ( $$kr{THISHOST} eq '' ) {
+                &Alert( $kr, 1, __LINE__, "THISHOST is an empty string" );
+        }
+
+        $$kr{THISUSER} = $ENV{LOGNAME};
+        chomp $$kr{THISUSER};
+        if ( $$kr{THISUSER} eq '' ) {
+                &Alert( $kr, 1, __LINE__, "THISUSER is an empty string" );
+        }
+
+        $$kr{THISPID}        = $$;
+        $$kr{TIMESTAMP}      = strftime '%Y-%m-%d_%H:%M:%S', localtime(time);
+        $$kr{EMAIL}          = '';
+        $$kr{HOST}           = '';
+        $$kr{REMOTEAUTHKEYS} = '';
+        $$kr{NEWAUTHKEYS}    = $$kr{TMPDIR} . "/newauthkeys";
+        $$kr{AKOPTIONS}      = '';
+        $$kr{OPTIONS}        = qq(StrictHostKeyChecking=no);
+        $$kr{KEYS}           = '';
+        $$kr{DEBUG}          = 0;
+        $$kr{DEBUGLOG}       = "$ENV{HOME}/.ssh/ssh-keyrot.debug.$$kr{TIMESTAMP}-$$kr{THISPID}";
+        $$kr{LOCKFILE}       = '';
+        $$kr{SCP}            = '';
+        $$kr{SSH}            = '';
+        $$kr{NEWKEY}         = '';
+        $$kr{KEYNAME}        = '';
+        $$kr{PWFILE}         = '';
+        $$kr{PASSWORD}       = '';
+
+        #
+        # process commandline arguments
+        #
+        GetOptions(
+                "bits=i"            => \$opts{bits},
+                "localkey=s"        => \$opts{localkey},
+                "type=s"            => \$opts{type},
+                "comment=s"         => \$opts{comments},
+                "remoteuser=s"      => \$opts{remoteuser},
+                "sshconfig=s"       => \$opts{sshconfig},
+                "port=i"            => \$opts{port},
+                "option=s"          => \$opts{options},
+                "mail=s"            => \$opts{mail},
+                "targetfile=s"      => \$opts{targetfile},
+                "keyoptions=s"      => \$opts{keyoptions},
+                "host=s"            => \$opts{host},
+                "pwfile=s"          => \$opts{pwfile},
+                "debug"             => \$opts{debug},
+                "help"              => \$opts{help},
+                "with-ssh=s"        => \$opts{with_ssh},
+                "with-scp=s"        => \$opts{with_scp},
+                "with-ssh-keygen=s" => \$opts{with_ssh_keygen},
+                "readme"            => \$opts{readme},
+        );
+
+        if   ( $opts{help} ) { $$kr{PrintUsage} = 1; }
+        else                 { $$kr{PrintUsage} = 0; }
+
+        if   ( $opts{readme} ) { $$kr{PrintReadme} = 1; }
+        else                   { $$kr{PrintReadme} = 0; }
+
+        $$kr{SCP_CMD} = qq(/usr/bin/scp);
+        if ( $opts{with_scp} ) {
+                $$kr{SCP_CMD} = $opts{with_scp};
+        }
+        unless ( -f "$$kr{SCP_CMD}" ) {
+                &Alert( $kr, 1, __LINE__, "scp not found at $$kr{SCP_CMD}" );
+        }
+        $$kr{SCP} = $$kr{SCP_CMD};
+
+        $$kr{SSH_CMD} = qq(/usr/bin/ssh);
+        if ( $opts{with_ssh} ) {
+                $$kr{SSH_CMD} = $opts{with_ssh};
+        }
+        unless ( -f "$$kr{SSH_CMD}" ) {
+                &Alert( $kr, 1, __LINE__, "ssh not found at $$kr{SSH_CMD}" );
+        }
+        $$kr{SSH} = $$kr{SSH_CMD};
+
+        $$kr{KEYGEN_CMD} = qq(/usr/bin/ssh-keygen);
+        if ( $opts{with_ssh_keygen} ) {
+                $$kr{KEYGEN_CMD} = $opts{with_ssh_keygen};
+        }
+
+        unless ( -f "$$kr{KEYGEN_CMD}" ) {
+                &Alert( $kr, 1, __LINE__, "ssh-keygen not found at $$kr{KEYGEN_CMD}" );
+        }
+
+        $$kr{KEYGEN} = $$kr{KEYGEN_CMD} . qq( -N "" );
+
+        if ( $opts{bits} ) {
+                $$kr{KEYGEN} = "$$kr{KEYGEN} -b $opts{bits}";
+        }
+
+        if ( $opts{localkey} ) {
+                $$kr{KEYS} = qq($opts{localkey});
+                $$kr{KEYS} =~ s/\.pub$//x;
+                @a_keys = split( /\//x, $$kr{KEYS} );
+                $$kr{KEYNAME} = ${ a_keys [$#a_keys] };
+                $$kr{SCP} .= qq( -i $opts{localkey});
+                $$kr{SSH} .= qq( -i $opts{localkey});
+        }
+
+        if ( $opts{type} ) {
+                $$kr{KEYGEN} .= qq( -t $opts{type});
+
+        }
+
+        if ( $opts{comment} ) {
+                $$kr{IDTAG} = $opts{comment};
+        } else {
+                $$kr{IDTAG} = $ENV{USER} . '@' . $$kr{THISHOST};
+        }
+
+        $$kr{KEYGEN} .= " -C " . $$kr{IDTAG};
+        if ( $opts{remoteuser} ) {
+                $$kr{REMOTEUSER} = $opts{remoteuser};
+        }
+
+        if ( $opts{sshconfig} ) {
+                $$kr{KEYGEN} .= qq( -F $opts{sshconfig});
+                $$kr{SCP}    .= qq( -F $opts{sshconfig});
+                $$kr{SSH}    .= qq( -F $opts{sshconfig});
+        }
+
+        if ( $opts{port} ) {
+                $$kr{SCP} .= qq( -p $opts{port});
+                $$kr{SSH} .= qq( -p $opts{port});
+        }
+
+        if ( $opts{options} ) {
+                $$kr{OPTIONS} .= qq(,$opts{options});
+        }
+
+        if ( $opts{mail} ) {
+                $$kr{EMAIL} = qq($opts{mail});
+        }
+
+        if ( $opts{targetfile} ) {
+                $$kr{REMOTEAUTHKEYS} = qq($opts{targetfile});
+        }
+
+        if ( $opts{pwfile} ) {
+                $$kr{PWFILE} = qq($opts{pwfile});
+        }
+
+        if ( $opts{debug} ) {
+                $$kr{DEBUG} = 1;
+        }
+
+        if ( $opts{keyoptions} ) {
+                $$kr{AKOPTIONS} = $opts{keyoptions};
+        }
+
+        if ( $opts{host} ) {
+                $$kr{HOST} = $opts{host};
+        }
+
+        $$kr{LOCKFILE} = $$kr{REMOTEAUTHKEYS} . ".lock";
+        $$kr{SCP}      = qq($$kr{SCP} -o $$kr{OPTIONS});
+        $$kr{SSH}      = qq($$kr{SSH} -o $$kr{OPTIONS});
+        $$kr{NEWKEY}   = $$kr{TMPDIR} . '/' . $$kr{KEYNAME};
+
+        &Debug( $kr, __LINE__, qq(command: $0 $$kr{cmdargs}\n\n) );
+        foreach my $key (%opts) {
+                &Debug( $kr, __LINE__, qq(opts{$key} = $opts{$key}) );
+        }
+        foreach my $key (%$kr) {
+                &Debug( $kr, __LINE__, qq(kr{$key} = $$kr{$key}) );
+        }
+
+        return 0;
+}
+################################################################################
+
+################################################################################
+sub TestKeys {
+        my $kr = shift;
+        my $cmd;
+        my @cmdOut;
+        my $cmdIn;
+        my $cmdOut;
+        my $cmdErr;
+        my $pid;
+
+        $cmd = qq($$kr{SSH} $$kr{REMOTEUSER}\@$$kr{HOST} "echo THISISATEST");
+        $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+        waitpid( $pid, 0 );
+        @cmdOut = (<$cmdOut>);
+        &Debug( $kr, __LINE__, "CMD: $cmd\nCMDOUT: @cmdOut" );
+        unless ( grep { /THISISATEST/x } @cmdOut ) {
+                &Alert( $kr, 0, __LINE__, "The key has been rotated, but the final test failed.\n" . "You will need to rotate by hand.\n\n" . "Ssh-keyrot will attempt to revert the keys.\n\n" . "TestKeys output is @cmdOut\n\n" );
+                &Debug( $kr, __LINE__, "Test failed, output is @cmdOut" );
+
+                $cmd = qq(/bin/cp -f $$kr{KEYS}.old $$kr{KEYS});
+                $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+                waitpid( $pid, 0 );
+                &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+
+                $cmd = qq(/bin/cp -f $$kr{KEYS}.old $$kr{KEYS});
+                $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+                waitpid( $pid, 0 );
+                if (<$cmdErr>) {
+                        &Alert( $kr, 1, __LINE__, "Command failed: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+                }
+                &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+
+                $cmd = qq(/bin/cp -f $$kr{KEYS}.pub.old $$kr{KEYS}.pub);
+                $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+                waitpid( $pid, 0 );
+                if (<$cmdErr>) {
+                        &Alert( $kr, 1, __LINE__, "Command failed: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+                }
+                &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+
+        }
+
+        return 0;
+}
+################################################################################
+
+################################################################################
+sub CycleKeys {
+        my $kr     = shift;
+        my @keys   = ();
+        my $cmd    = ();
+        my @cmdtmp = ();
+        my $try    = 1;
+        my @lockdetails;
+        my $lockfile;
+        my $trys;
+        my $sleep;
+        my $newkey;
+        my $regrab_success = 0;
+        my $ps;
+        my $proc;
+        my $lockpid;
+        my $lockhost;
+        my $file;
+        my $lockfd;
+        my $cmdIn;
+        my $cmdOut;
+        my $cmdErr;
+        my $scpe;
+        my $login_output;
+        my $pid;
+        my $remote_ssh_dir = $$kr{REMOTEAUTHKEYS};
+        $remote_ssh_dir =~ s/(.+)?\/.+/$1/;
+
+        &Debug( $kr, __LINE__, "CycleKeys start  ####################" );
+
+        if ( $$kr{PASSWORD} =~ /.+/ ) {
+                &Debug( $kr, __LINE__, "Setting up net::scp::expect" );
+                $scpe = Net::SCP::Expect->new(
+                        user     => "$$kr{REMOTEUSER}",
+                        password => "$$kr{PASSWORD}",
+                        auto_yes => 1,
+                        no_check => 1
+                );
+        }
+
+        ##
+        &Debug( $kr, __LINE__, "check for lockfile on remote host" );
+        ##
+        $trys = 5;
+        while ( $try++ <= $trys ) {
+                if ( $$kr{PASSWORD} =~ /.+/ ) {
+                        &Debug( $kr, __LINE__, "using net::scp::expect to retreive lockfile" );
+                        $scpe->scp( "$$kr{HOST}:$$kr{LOCKFILE}", "$$kr{TMPDIR}/lock" );
+                } else {
+                        $cmd = qq($$kr{SCP} $$kr{REMOTEUSER}\@$$kr{HOST}:$$kr{LOCKFILE} $$kr{TMPDIR}/lock 2>&1);
+                        $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+                        waitpid( $pid, 0 );
+                        &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+                }
+                if ( -f "$$kr{TMPDIR}/lock" ) {
+                        if ( $try >= $trys ) {
+
+                                # Read the lockfile and see if pid is actually running.
+                                # If not, continue.
+                                open( $lockfd, '<', "$$kr{TMPDIR}/lock" )
+                                  or &Alert( $kr, 1, __LINE__, "Unable to open $$kr{TMPDIR}/lock \n$OS_ERROR" );
+                                while (<$lockfd>) {
+                                        chomp;
+                                        $lockfile = $_;
+                                }
+                                close($lockfd);
+                                @lockdetails = split( /::/x, $lockfile );
+
+                                #user::$$kr{THISUSER}::host::$$kr{THISHOST}::pid::$$kr{THISPID}::time::$$kr{TIMESTAMP}
+                                &Debug( $kr, __LINE__, "Lockfile user:$lockdetails[1] host:$lockdetails[3] pid:$lockdetails[5]" );
+                                $lockhost = $lockdetails[3];
+                                &Debug( $kr, __LINE__, "Check lockfile host $lockhost and thishost $$kr{THISHOST}" );
+                                print "Check lockfile host $lockhost and thishost $$kr{THISHOST}\n";
+                                if ( $lockhost ne $$kr{THISHOST} ) {
+                                        &Alert( $kr, 1, __LINE__, "SOME OTHER HOST IS TRYING TO ROTATE THIS KEY\n" . "lockfile $$kr{HOST}:$$kr{LOCKFILE} exists. Details: $lockfile" );
+                                }
+
+                                $lockpid = $lockdetails[5];
+                                $ps      = new Proc::ProcessTable;
+                                foreach my $proc ( @{ $ps->table } ) {
+                                        if ( $$proc{pid} == $lockpid ) {
+                                                &Alert( $kr, 1, __LINE__, "lockfile $$kr{HOST}:$$kr{LOCKFILE} exists. Details: $lockfile" );
+                                        }
+                                }
+                        } else {
+                                $sleep = int( rand(20) ) + 20;
+                                &Debug( $kr, __LINE__, "Lockfile exists.  sleeping $sleep" );
+                                sleep($sleep);
+                        }
+
+                        # remove lockfile for the next run
+                        unlink("$$kr{TMPDIR}/lock");
+                } else {
+                        last;
+                }
+        }
+
+        ##
+        &Debug( $kr, __LINE__, "Check to see if $remote_ssh_dir exists on remote host" );
+        ##
+        if ( $$kr{PASSWORD} =~ /.+/ ) {
+                my $ssh = Net::SSH::Expect->new(
+                        host     => $$kr{HOST},
+                        password => $$kr{PASSWORD},
+                        user     => $$kr{REMOTEUSER},
+                        raw_pty  => 1
+                );
+                $login_output = $ssh->login();
+                $cmdOut       = $ssh->exec("ls -d $remote_ssh_dir");
+                unless ( grep( /drwx------/, $cmdOut ) ) {
+                        $ssh->exec("mkdir -p $remote_ssh_dir");
+                        $ssh->exec("chmod 700 $remote_ssh_dir");
+                }
+                $ssh->close();
+        }
+
+        ##
+        &Debug( $kr, __LINE__, "No lock exists so we are free to continue\nCreating lockfile on remote host" );
+        ##
+        if ( $$kr{PASSWORD} =~ /.+/ ) {
+                my $ssh = Net::SSH::Expect->new(
+                        host     => $$kr{HOST},
+                        password => $$kr{PASSWORD},
+                        user     => $$kr{REMOTEUSER},
+                        raw_pty  => 1
+                );
+                my $login_output = $ssh->login();
+                my $cmdOut       = $ssh->exec( "/bin/echo user::$$kr{THISUSER}::host::$$kr{THISHOST}::pid::$$kr{THISPID}::time::$$kr{TIMESTAMP} > $$kr{LOCKFILE}" );
+                $ssh->close();
+        } else {
+                $cmd = qq($$kr{SSH} $$kr{REMOTEUSER}\@$$kr{HOST} "/bin/echo user::$$kr{THISUSER}::host::$$kr{THISHOST}::pid::$$kr{THISPID}::time::$$kr{TIMESTAMP} > $$kr{LOCKFILE}" 2>&1);
+                $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+                waitpid( $pid, 0 );
+                &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+        }
+
+        ##
+        &Debug( $kr, __LINE__, "generate new keys" );
+        ##
+        $cmd = qq($$kr{KEYGEN} -f $$kr{NEWKEY} 2>&1);
+        $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+        waitpid( $pid, 0 );
+        &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+
+        ##
+        &Debug( $kr, __LINE__, "grab authorized keys from remote host" );
+        ##
+        if ( $$kr{PASSWORD} =~ /.+/ ) {
+                &Debug( $kr, __LINE__, "using net::scp::expect to retreive authorized_keys" );
+                $scpe->scp( "$$kr{HOST}:/$$kr{REMOTEAUTHKEYS}", "$$kr{NEWAUTHKEYS}" );
+        } else {
+                $cmd = qq($$kr{SCP} $$kr{REMOTEUSER}\@$$kr{HOST}:/$$kr{REMOTEAUTHKEYS} $$kr{NEWAUTHKEYS} 2>&1);
+                $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+                waitpid( $pid, 0 );
+                &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+        }
+
+        if ( -f "$$kr{NEWAUTHKEYS}" ) {
+                ##
+                &Debug( $kr, __LINE__, "push old keys into array, excluding old id: $$kr{IDTAG}" );
+                ##
+                open( $file, '<', "$$kr{NEWAUTHKEYS}" )
+                  or &Alert( $kr, 1, __LINE__, "Unable to open $$kr{NEWAUTHKEYS} \n$OS_ERROR" );
+                while (<$file>) {
+                        push( @keys, $_ );
+                }
+                close($file);
+        } else {
+                @keys = ();
+        }
+
+        $newkey = $$kr{AKOPTIONS};
+        open( $file, '<', "$$kr{NEWKEY}.pub" )
+          or &Alert( $kr, 1, __LINE__, "Unable to open $$kr{NEWKEY}.pub \n$OS_ERROR" );
+        while (<$file>) {
+                chomp;
+                $newkey .= ' ' . $_;
+        }
+        close($file);
+        $newkey .= " keyrot:$$kr{TIMESTAMP}\n";
+        $newkey =~ s/^\s+//gx;
+        &Debug( $kr, __LINE__, "new key is $newkey" );
+
+        ##
+        &Debug( $kr, __LINE__, "write new authorized keys file with new key" );
+        ##
+        open( $file, '>', "$$kr{NEWAUTHKEYS}" )
+          or &Alert( $kr, 1, __LINE__, "Unable to open $$kr{NEWAUTHKEYS} \n$OS_ERROR" );
+        foreach (@keys) {
+                $_ =~ s/^\s+//gx;
+                print $file $_;
+        }
+        print $file qq($newkey);
+        close($file);
+
+        ##
+        &Debug( $kr, __LINE__, "push new authorized keys, with new key, to host" );
+        ##
+        if ( $$kr{PASSWORD} =~ /.+/ ) {
+                &Debug( $kr, __LINE__, "using net::scp::expect to push new authorized_keys" );
+                $scpe->scp( "$$kr{NEWAUTHKEYS}", "$$kr{HOST}:/$$kr{REMOTEAUTHKEYS}" );
+        } else {
+                $cmd = qq($$kr{SCP} $$kr{NEWAUTHKEYS} $$kr{REMOTEUSER}\@$$kr{HOST}:$$kr{REMOTEAUTHKEYS});
+                $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+                waitpid( $pid, 0 );
+                &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+        }
+
+        # usually I would check the error code, but scp can lie with false+ and false-
+
+        #
+        # pull the authorized_keys file again and check to make sure our new key exists
+        # Otherwise, fail and exit before overwriting the old keypair
+        #
+        ##
+        &Debug( $kr, __LINE__, "re-grab authorized keys from remote host. NEWAUTHKEYS is $$kr{NEWAUTHKEYS}." );
+        ##
+        unlink("$$kr{NEWAUTHKEYS}");
+        @keys = ();
+        if ( $$kr{PASSWORD} =~ /.+/ ) {
+                &Debug( $kr, __LINE__, "using net::scp::expect to re-grab new authorized_keys" );
+                $scpe->scp( "$$kr{HOST}:/$$kr{REMOTEAUTHKEYS}", "$$kr{NEWAUTHKEYS}" );
+        } else {
+                $cmd = qq($$kr{SCP} -i $$kr{NEWKEY} $$kr{REMOTEUSER}\@$$kr{HOST}:/$$kr{REMOTEAUTHKEYS} $$kr{NEWAUTHKEYS} 2>&1);
+                $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+                waitpid( $pid, 0 );
+                &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+        }
+
+        if ( -f "$$kr{NEWAUTHKEYS}" ) {
+                ##
+                &Debug( $kr, __LINE__, "Searching re-grabbed authkeys in file $$kr{NEWAUTHKEYS}" );
+                ##
+                open( $file, '<', "$$kr{NEWAUTHKEYS}" )
+                  or &Alert( $kr, 1, __LINE__, "Unable to open $$kr{NEWAUTHKEYS} \n$OS_ERROR" );
+                while (<$file>) {
+                        &Debug( $kr, __LINE__, "Checking for $$kr{IDTAG} keyrot: in $_" );
+                        if ( $_ =~ /$$kr{IDTAG}\s+keyrot:/x ) {
+                                &Debug( $kr, __LINE__, "Found an IDTAG in $_" );
+                                if ( $_ =~ /$$kr{IDTAG}\s+keyrot:$$kr{TIMESTAMP}/x ) {
+                                        &Debug( $kr, __LINE__, "Found our IDTAG in $_" );
+                                        $regrab_success = 1;
+                                        push( @keys, $_ );
+                                }
+                        } else {
+                                push( @keys, $_ );
+                        }
+                }
+                close($file);
+        } else {
+                &RemoveRemoteLock($kr);
+                &Alert( $kr, 1, __LINE__, "Unable to re-pull authorized_keys from $$kr{HOST}:$$kr{REMOTEAUTHKEYS}" );
+        }
+
+        if ( $regrab_success == 0 ) {
+                &RemoveRemoteLock($kr);
+                &Alert( $kr, 1, __LINE__, "New key disappeared after authorized_keys regrab" );
+        }
+
+        ##
+        &Debug( $kr, __LINE__, "write new authorized keys file without old key" );
+        ##
+        open( $file, '>', "$$kr{NEWAUTHKEYS}" )
+          or &Alert( $kr, 1, __LINE__, "Unable to open $$kr{NEWAUTHKEYS} \n$OS_ERROR" );
+        foreach (@keys) {
+                $_ =~ s/^\s+//gx;
+                print $file $_;
+        }
+        close($file);
+
+        ##
+        &Debug( $kr, __LINE__, "push new authorized keys, without old key, to host" );
+        ##
+        if ( $$kr{PASSWORD} =~ /.+/ ) {
+                &Debug( $kr, __LINE__, "using net::scp::expect to re-grab new authorized_keys" );
+                $scpe->scp( "$$kr{NEWAUTHKEYS}", "$$kr{HOST}:/$$kr{REMOTEAUTHKEYS}" );
+        } else {
+                $cmd = qq($$kr{SCP} $$kr{NEWAUTHKEYS} $$kr{REMOTEUSER}\@$$kr{HOST}:$$kr{REMOTEAUTHKEYS});
+                $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+                waitpid( $pid, 0 );
+                &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+        }
+
+        ##
+        &Debug( $kr, __LINE__, "replace old keys" );
+        ##
+
+        # backup
+        $cmd = qq(/bin/cp -f $$kr{KEYS}.pub $$kr{KEYS}.pub.old);
+        $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+        waitpid( $pid, 0 );
+        &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+
+        $cmd = qq(/bin/cp -f $$kr{KEYS} $$kr{KEYS}.old);
+        $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+        waitpid( $pid, 0 );
+        &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+
+        # copy in new keys
+        $cmd = qq(/bin/cp -f $$kr{NEWKEY}.pub $$kr{KEYS}.pub);
+        $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+        waitpid( $pid, 0 );
+        &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+
+        $cmd = qq(/bin/cp -f $$kr{NEWKEY} $$kr{KEYS});
+        $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+        waitpid( $pid, 0 );
+        &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+
+        # chmod 600 new and old keys
+        $cmd = qq(chmod 600 $$kr{KEYS});
+        $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+        waitpid( $pid, 0 );
+        &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+
+        $cmd = qq(chmod 600 $$kr{KEYS}.pub);
+        $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+        waitpid( $pid, 0 );
+        &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+
+        $cmd = qq(chmod 600 $$kr{KEYS}.old);
+        $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+        waitpid( $pid, 0 );
+        &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+
+        $cmd = qq(chmod 600 $$kr{KEYS}.pub.old);
+        $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+        waitpid( $pid, 0 );
+        &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+
+        &RemoveRemoteLock($kr);
+
+        &Debug( $kr, __LINE__, "CycleKeys end  ####################" );
+
+        return 0;
+}
+################################################################################
+
+################################################################################
+sub RemoveRemoteLock {
+        my $kr = shift;
+        my $cmd;
+        my $cmdOut;
+        my $cmdErr;
+        my $cmdIn;
+        my $login_output;
+        my $pid;
+
+        if ( $$kr{PASSWORD} =~ /.+/ ) {
+                my $ssh = Net::SSH::Expect->new(
+                        host     => $$kr{HOST},
+                        password => $$kr{PASSWORD},
+                        user     => $$kr{REMOTEUSER},
+                        raw_pty  => 1
+                );
+                $login_output = $ssh->login();
+                $cmdOut       = $ssh->exec("/bin/rm -rf $$kr{LOCKFILE}");
+                $ssh->close();
+        } else {
+                $cmd = qq($$kr{SSH} $$kr{REMOTEUSER}\@$$kr{HOST} "/bin/rm -f $$kr{LOCKFILE}" 2>&1);
+                $pid = open3( $cmdIn, $cmdOut, $cmdErr, "$cmd" );
+                waitpid( $pid, 0 );
+                &Debug( $kr, __LINE__, "CMD: $cmd \ncmdOut: " . <$cmdOut> . "cmdErr: " . <$cmdErr> );
+        }
+
+        return 0;
+}
+################################################################################
+
+################################################################################
+sub Alert {
+        my $kr         = shift;
+        my $alertlevel = shift;
+        my $line       = shift;
+        my $alert      = shift;
+        my $subject    = "ssh-keyrot error on $$kr{THISHOST} to $$kr{HOST}";
+        my $from       = 'ssh-keyrot';
+        my $debuglogfile;
+        my $mailMessage;
+        my %mail;
+
+        print STDERR qq(ALERT on line $line: $alert\n);
+
+        if ( $$kr{EMAIL} ne "" ) {
+                $mailMessage = qq($line: $alert\n\n\n) . qq(command: $0 $$kr{cmdargs}\n\n) . qq(To reset, remove the lockfiles in \$HOME/.ssh/*.lock on both hosts.  ) . qq(Then run the command manually and keep typing the password.\n) . qq(\n.\n);
+
+                if ( $$kr{DEBUG} == 1 ) {
+                        open( $debuglogfile, '<', "$$kr{DEBUGLOG}" )
+                          or croak "Unable to open debug file $debuglogfile: $OS_ERROR";
+                        $mailMessage .= qq(\n\n\nDEBUG\n\n);
+                        while (<$debuglogfile>) {
+                                $mailMessage .= qq($_);
+                        }
+                        close($debuglogfile);
+                }
+
+                %mail = (
+                        To             => "$$kr{EMAIL}",
+                        From           => "$from",
+                        smtp           => "localhost",
+                        subject        => "$subject",
+                        'content-type' => "text/txt",
+                        Message        => $mailMessage
+                );
+                sendmail(%mail) or croak $Mail::Sendmail::error;
+        }
+
+        if ( $alertlevel == 1 ) {
+                &Debug( $kr, __LINE__, "$alert" );
+                &Cleanup($kr);
+                exit 1;
+        }
+        return 0;
+}
+################################################################################
+
+################################################################################
+sub PrintUsage {
+        print << 'EOF';
+How to use ssh-keyrot
+Anything starting with * is required.
+If you are running this for the very first time, they you will have to type the password several times.
+  --bits=bits                Number of bits in the key to create.
+* --localkey=filename        FULL PATH to the ssh private key file.
+  --type={dsa|rsa}           Specify type of key to create.  Options are rsa or dsa.
+  --comment="comment"        Provide comment that will be appended to the public key.
+* --remoteuser=username      Log in using this user name.
+  --sshconfig=filename       Config file (default: ~/.ssh/config).
+  --port=port                Connect to non-standard port.  Server must be on the same port.
+  --option="option"          Process the option as if it was read from a configuration file.
+* --mail="email"             Email all errors to specified recepient.
+* --targetfile="remote file" FULL PATHNAME to the authorized keys file on the target system.
+  --pwfile="password file"   Contains list of possible passwords to attempt if keys are not setup yet.
+  --debug                    debug
+  --keyoptions="options"     Options for the authorized key file.
+* --host=host                Host. 
+  --with-ssh=                Specify the fullpath of ssh executable.  Default is /usr/bin/ssh
+  --with-scp=                Specify the fullpath of scp executable.  Default is /usr/bin/scp
+  --with-ssh-keygen=         Specify the fullpath of ssh-keygen executable.  Default is /usr/bin/ssh-keygen
+  --help                     Show ssh-keyrot usage and exit
+
+example: ssh-keyrot --type=dsa --remoteuser=apache  --mail='emailalerts@domain.com' --targetfile=/home/apache/.ssh/authorized_keys --host=webserver01 --localkey=/home/user/.ssh/id_dsa-apache_webserver01
+EOF
+        return 0;
+}
+################################################################################
+
+################################################################################
+sub PrintReadme {
+        print << 'EOF';
+SSH-KeyRot is a program that will rotate ssh keys in environments where an individual key exists for each specific user and system.
+The purpose is to defeat the effectiveness of stolen keys.
+
+We recommend that you rotate your ssh keys daily, preferably automated with cron.
+We also recommend that you have one keypair per each user at each host, identified as ~/.ssh/id_dsa-user@host
+
+If this is your first time running ssh-keyrot, you may be prompted for the remote user's password 5 times.  An alternative is to use the --pwfile option with a file that contains a list of possible passwords.  Once initialized, you may rotate the key non-interactively as often as you like.
+Before you begin, please read the help screen by executing 'ssh-keyrot --help'
+
+How the key rotation works:
+1- Check for authorized_keys lockfile on remote server.  If a lockfile exists, ssh-keyrot will try again a few times at 20-40 second wait intervals.  Ssh-keyrot will send an email and exit if the lockfile remains.
+2- Ssh-keyrot will create a lockfile on the remote server, containing information such as the originating user, host, and pid.
+3- Generate new keys
+4- Pull authorized_keys from remote host
+5- Put new key in the remote's authorized_keys file
+6- Push the new authorized_keys file to the remote server
+7- Re-pull the authorized_keys from the remote server.  If this fails, ssh-keyrot will send an email and exit, leaving the current local keys untouched.
+8- Remove any keys from the remote's authorized_keys that matches the originating user & host, ignoring the current keyrot timestamp tag.  This is identified by the identity field of the public key
+9- Replace the current keys on the originating server.  Backups will be made with a '.old' extension.
+EOF
+        return 0;
+}
+################################################################################
