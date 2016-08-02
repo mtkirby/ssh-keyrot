@@ -93,7 +93,7 @@ sub Main {
     #
     &Debug( \%kr, __LINE__, "Rotating $kr{HOST} keys" );
     if ( &TestConnect( \%kr, $kr{HOST} ) != 0 ) {
-        &Alert( \%kr, 1, __LINE__, "Cannot connect to $kr{HOST} on port 22" );
+        &Alert( \%kr, 1, __LINE__, "Cannot connect to $kr{HOST} on port $kr{PORT}" );
     }
     if ( $kr{PWFILE} ) {
         # try each password from file and set $kr{PASSWORD}
@@ -177,7 +177,7 @@ sub TestConnect {
 
     $socket = IO::Socket::INET->new(
         PeerAddr => $host,
-        PeerPort => 22,
+        PeerPort => $$kr{PORT},
         Timeout  => 10,
         Proto    => "tcp",
         Type     => SOCK_STREAM
@@ -191,7 +191,7 @@ sub TestConnect {
         sleep(5);
         $socket = IO::Socket::INET->new(
             PeerAddr => $host,
-            PeerPort => 22,
+            PeerPort => $$kr{PORT},
             Timeout  => 20,
             Proto    => "tcp",
             Type     => SOCK_STREAM
@@ -407,6 +407,9 @@ sub BuildEnv {
     if ( $opts{port} ) {
         $$kr{SCP} .= qq( -p $opts{port});
         $$kr{SSH} .= qq( -p $opts{port});
+        $$kr{PORT} = $opts{port};
+    } else {
+        $$kr{PORT} = 22;
     }
 
     if ( $opts{options} ) {
