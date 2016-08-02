@@ -4,7 +4,7 @@ SSH-KeyRot is a program that will rotate ssh authentication keys on local and re
 The purpose is to defeat the effectiveness of stolen keys.
 
 We recommend that you rotate your ssh keys daily, preferably automated with cron.
-We also recommend that you have one keypair per each user at each host, identified as ~/.ssh/id_dsa-user@host
+We also recommend that you have one keypair per each user at each host, identified as ~/.ssh/id_rsa-user@host
 
 If this is your first time running ssh-keyrot, you may be prompted for the remote user's password 5 times.  An alternative is to use the --pwfile option with a file that contains a list of possible passwords.  Once initialized, you may rotate the key non-interactively as often as you like.
 Before you begin, please read the help screen by executing 'ssh-keyrot --help'
@@ -25,26 +25,26 @@ How the key rotation works:
 How to use ssh-keyrot
 Anything starting with * is required.
 If you are running this for the very first time, they you will have to type the password several times.
-  --bits=bits                Number of bits in the key to create.
-* --localkey=filename        FULL PATH to the ssh private key file.
-  --type={dsa|rsa}           Specify type of key to create.  Options are rsa or dsa.
-  --comment="comment"        Provide comment that will be appended to the public key.
-* --remoteuser=username      Log in using this user name.
-  --sshconfig=filename       Config file (default: ~/.ssh/config).
-  --port=port                Connect to non-standard port.  Server must be on the same port.
-  --option="option"          Process the option as if it was read from a configuration file.
-* --mail="email"             Email all errors to specified recepient.
-* --targetfile="remote file" FULL PATHNAME to the authorized keys file on the target system.
-  --pwfile="password file"   Contains list of possible passwords to attempt if keys are not setup yet.
-  --debug                    debug
-  --keyoptions="options"     Options for the authorized key file.
-* --host=host                Host. 
-  --with-ssh=                Specify the fullpath of ssh executable.  Default is /usr/bin/ssh
-  --with-scp=                Specify the fullpath of scp executable.  Default is /usr/bin/scp
-  --with-ssh-keygen=         Specify the fullpath of ssh-keygen executable.  Default is /usr/bin/ssh-keygen
-  --help                     Show ssh-keyrot usage and exit
+  --bits=bits                     Number of bits in the key to create.
+* --localkey=filename             FULL PATH to the ssh private key file.
+  --type={dsa|rsa|ecdsa|ed25519}  Specify type of key to create.  Options are rsa, dsa, ecdsa, ed25519.
+  --comment="comment"             Provide comment that will be appended to the public key.
+* --remoteuser=username           Log in using this user name.
+  --sshconfig=filename            Config file (default: ~/.ssh/config).
+  --port=port                     Connect to non-standard port.  Server must be on the same port.
+  --option="option"               Process the option as if it was read from a configuration file.
+* --mail="email"                  Email all errors to specified recepient.
+* --targetfile="remote file"      FULL PATHNAME to the authorized keys file on the target system.
+  --pwfile="password file"        Contains list of possible passwords to attempt if keys are not setup yet.
+  --debug                         debug
+  --keyoptions="options"          Options for the authorized key file.
+* --host=host                     Host. 
+  --with-ssh=                     Specify the fullpath of ssh executable.  Default is /usr/bin/ssh
+  --with-scp=                     Specify the fullpath of scp executable.  Default is /usr/bin/scp
+  --with-ssh-keygen=              Specify the fullpath of ssh-keygen executable.  Default is /usr/bin/ssh-keygen
+  --help                          Show ssh-keyrot usage and exit
 
-example: ssh-keyrot --type=dsa --remoteuser=apache  --mail='emailalerts@domain.com' --targetfile=/home/apache/.ssh/authorized_keys --host=webserver01 --localkey=/home/user/.ssh/id_dsa-apache_webserver01
+example: ssh-keyrot --type=rsa --remoteuser=apache  --mail='emailalerts@domain.com' --targetfile=/home/apache/.ssh/authorized_keys --host=webserver01 --localkey=/home/user/.ssh/id_rsa-apache_webserver01
 
 
 
